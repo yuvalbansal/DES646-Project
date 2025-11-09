@@ -12,7 +12,7 @@ from torchvision import datasets, transforms, models
 # ==========================
 # CONFIGURATION
 # ==========================
-DATA_DIR = "dataset"                   # path to dataset (train/, test/)
+DATA_DIR = "dataset_trimmed"                   # path to dataset (train/, test/)
 SAVE_DIR = "runs/checkpoints"
 MODEL_NAME = "mobilenetv3_small"
 IMG_SIZE = 224
