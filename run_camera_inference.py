@@ -3,6 +3,7 @@ import json
 import time
 from pathlib import Path
 from collections import deque, Counter
+from PIL import Image
 
 import cv2
 import numpy as np
@@ -11,7 +12,7 @@ import torch.nn as nn
 from torchvision import transforms, models
 
 # ======== Config (tweak here or via CLI if you like) ========
-CKPT_PATH = "runs/checkpoints/best_snapshot.pt"
+CKPT_PATH = "runs/checkpoints/best.pt"
 META_PATH = "runs/checkpoints/metadata.json"
 CAMERA_INDEX = 0                 # change to your USB cam index if needed
 IMG_SIZE_DEFAULT = 224
@@ -20,16 +21,20 @@ STABILITY_FRAMES = 5             # frames of the same top class before commit
 MIN_CONFIDENCE = 0.70            # softmax prob threshold to commit
 ROI_MARGIN = 20                  # extra pixels around detected hand box
 DRAW = True                      # draw overlays
-MIRROR = True                    # mirror camera for natural UX
+MIRROR = False                    # mirror camera for natural UX
 
-# ======== Optional: try to use MediaPipe Hands for better ROI ========
+# ======== Optional: try to use MediaPipe Hands for better ROI/drawing ========
 try:
     import mediapipe as mp
     MP_AVAILABLE = True
     mp_hands = mp.solutions.hands
+    mp_draw = mp.solutions.drawing_utils
+    mp_styles = mp.solutions.drawing_styles
 except Exception:
     MP_AVAILABLE = False
     mp_hands = None
+    mp_draw = None
+    mp_styles = None
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -65,13 +70,14 @@ def softmax_np(x):
     return e / np.sum(e, axis=1, keepdims=True)
 
 
-def get_hand_roi(frame_bgr, last_roi=None):
+def get_hand_roi(frame_bgr, last_roi=None, hands_processor=None):
     """
-    Returns: roi_bgr, (x1, y1, x2, y2) bbox
-    Uses MediaPipe if available; otherwise returns a centered square crop.
+    Returns: (roi_bgr, (x1,y1,x2,y2), hand_landmarks_or_None)
+    If MediaPipe hands_processor is provided, uses it to detect hand landmarks and compute a bbox.
+    Otherwise returns a centered square crop.
     """
     h, w = frame_bgr.shape[:2]
-    # Fallback: center square crop
+
     def center_crop():
         side = min(h, w)
         cx, cy = w // 2, h // 2
@@ -79,40 +85,33 @@ def get_hand_roi(frame_bgr, last_roi=None):
         y1 = max(0, cy - side // 2)
         x2 = min(w, x1 + side)
         y2 = min(h, y1 + side)
-        return frame_bgr[y1:y2, x1:x2], (x1, y1, x2, y2)
+        return frame_bgr[y1:y2, x1:x2], (x1, y1, x2, y2), None
 
-    if not MP_AVAILABLE:
+    if not MP_AVAILABLE or hands_processor is None:
         return center_crop()
 
-    # Use MediaPipe Hands
-    with mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=1,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    ) as hands:
-        # NOTE: MediaPipe expects RGB
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        res = hands.process(rgb)
+    # MediaPipe expects RGB for processing
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    res = hands_processor.process(rgb)
 
-        if not res.multi_hand_landmarks:
-            # if we had a last ROI, keep using it briefly
-            if last_roi is not None:
-                x1, y1, x2, y2 = last_roi
-                x1 = max(0, x1); y1 = max(0, y1); x2 = min(w, x2); y2 = min(h, y2)
-                return frame_bgr[y1:y2, x1:x2], (x1, y1, x2, y2)
-            return center_crop()
+    if not res.multi_hand_landmarks:
+        # reuse last bbox if available
+        if last_roi is not None:
+            x1, y1, x2, y2 = last_roi
+            x1 = max(0, x1); y1 = max(0, y1); x2 = min(w, x2); y2 = min(h, y2)
+            return frame_bgr[y1:y2, x1:x2], (x1, y1, x2, y2), None
+        return center_crop()
 
-        # compute bbox around landmarks
-        hand_landmarks = res.multi_hand_landmarks[0]
-        xs = [int(lm.x * w) for lm in hand_landmarks.landmark]
-        ys = [int(lm.y * h) for lm in hand_landmarks.landmark]
-        x1, x2 = max(0, min(xs) - ROI_MARGIN), min(w, max(xs) + ROI_MARGIN)
-        y1, y2 = max(0, min(ys) - ROI_MARGIN), min(h, max(ys) + ROI_MARGIN)
-        roi = frame_bgr[y1:y2, x1:x2]
-        if roi.size == 0:
-            return center_crop()
-        return roi, (x1, y1, x2, y2)
+    # compute bbox around first detected hand's landmarks
+    hand_landmarks = res.multi_hand_landmarks[0]
+    xs = [int(lm.x * w) for lm in hand_landmarks.landmark]
+    ys = [int(lm.y * h) for lm in hand_landmarks.landmark]
+    x1, x2 = max(0, min(xs) - ROI_MARGIN), min(w, max(xs) + ROI_MARGIN)
+    y1, y2 = max(0, min(ys) - ROI_MARGIN), min(h, max(ys) + ROI_MARGIN)
+    roi = frame_bgr[y1:y2, x1:x2]
+    if roi.size == 0:
+        return center_crop()
+    return roi, (x1, y1, x2, y2), hand_landmarks
 
 
 def draw_overlay(frame, committed_text, current_pred, conf, bbox=None, fps=None):
@@ -136,6 +135,59 @@ def draw_overlay(frame, committed_text, current_pred, conf, bbox=None, fps=None)
         cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
 
 
+def draw_hand_lines_on_frame(frame, hand_landmarks):
+    """
+    Draws per-finger thicker colored lines on the full frame using MediaPipe landmark coords.
+    Expects hand_landmarks from MediaPipe and frame in BGR.
+    """
+    if hand_landmarks is None:
+        return
+
+    h_img, w_img = frame.shape[:2]
+
+    # Draw the default lightweight MediaPipe landmarks/connections for reference (optional)
+    if mp_draw is not None and mp_styles is not None:
+        try:
+            mp_draw.draw_landmarks(
+                frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+                mp_styles.get_default_hand_landmarks_style(),
+                mp_styles.get_default_hand_connections_style()
+            )
+        except Exception:
+            # fallback: draw simple mp landmarks if styled draw fails
+            mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+
+    # MediaPipe landmark indexing:
+    # wrist=0, thumb=1..4, index=5..8, middle=9..12, ring=13..16, pinky=17..20
+    fingers = [
+        [1, 2, 3, 4],    # thumb (skip wrist to avoid long lines)
+        [5, 6, 7, 8],    # index
+        [9, 10, 11, 12], # middle
+        [13, 14, 15, 16],# ring
+        [17, 18, 19, 20] # pinky
+    ]
+    finger_colors = [
+        (0, 0, 255),    # red
+        (0, 165, 255),  # orange
+        (0, 255, 255),  # yellow
+        (0, 255, 0),    # green
+        (255, 0, 0),    # blue
+    ]
+
+    # Convert normalized landmarks to pixel coords
+    lm_coords = []
+    for lm in hand_landmarks.landmark:
+        lm_x = int(lm.x * w_img)
+        lm_y = int(lm.y * h_img)
+        lm_coords.append((lm_x, lm_y))
+
+    # Draw polyline for each finger with thicker stroke
+    for fi, finger in enumerate(fingers):
+        pts = [lm_coords[i] for i in finger]
+        for p0, p1 in zip(pts[:-1], pts[1:]):
+            cv2.line(frame, p0, p1, finger_colors[fi % len(finger_colors)], thickness=3, lineType=cv2.LINE_AA)
+
+
 def main():
     # ---------- Load checkpoint & metadata ----------
     if not Path(CKPT_PATH).exists():
@@ -154,9 +206,21 @@ def main():
     preprocess = get_preprocess(img_size, mean, std)
     model = build_model(num_classes=len(class_names), img_size=img_size, ckpt=ckpt)
 
+    # Create a single MediaPipe Hands processor once (reused each frame)
+    hands = None
+    if MP_AVAILABLE:
+        hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
     # ---------- Video capture ----------
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
+        if hands is not None:
+            hands.close()
         raise RuntimeError(f"Could not open camera index {CAMERA_INDEX}")
 
     committed_text = ""
@@ -169,84 +233,94 @@ def main():
     fps = 0.0
 
     print("Controls: [c] Clear | [b] Backspace | [q] Quit")
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if MIRROR:
-            frame = cv2.flip(frame, 1)
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if MIRROR:
+                frame = cv2.flip(frame, 1)
 
-        roi_bgr, bbox = get_hand_roi(frame, last_bbox)
-        last_bbox = bbox
+            # get ROI and hand landmarks (if available) — pass hands processor to avoid recreating it per-frame
+            roi_bgr, bbox, hand_landmarks = get_hand_roi(frame, last_bbox, hands_processor=hands)
+            last_bbox = bbox
 
-        # Preprocess ROI for model
-        roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
-        pil_like = cv2.resize(roi_rgb, (img_size, img_size), interpolation=cv2.INTER_AREA)
-        x = preprocess(pil_like).unsqueeze(0).to(DEVICE)
+            # draw finger lines on full frame if landmarks are available
+            if MP_AVAILABLE and hand_landmarks is not None:
+                draw_hand_lines_on_frame(frame, hand_landmarks)
 
-        # Inference
-        with torch.no_grad():
-            logits = model(x)
-            probs = torch.softmax(logits, dim=1).cpu().numpy()
-        probs = probs[0]
-        idx = int(np.argmax(probs))
-        conf = float(probs[idx])
-        label = class_names[idx]
+            # Preprocess ROI for model
+            roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+            pil_like = cv2.resize(roi_rgb, (img_size, img_size), interpolation=cv2.INTER_AREA)
+            pil_img = Image.fromarray(pil_like)               # convert numpy -> PIL Image
+            x = preprocess(pil_img).unsqueeze(0).to(DEVICE)
 
-        # Smoothing window
-        window.append((idx, conf))
-        # Majority vote on indices in the window
-        counts = Counter([i for i, _ in window])
-        top_idx, occurrences = counts.most_common(1)[0]
-        # Average confidence for that class in window
-        avg_conf = np.mean([c for i, c in window if i == top_idx])
-        top_label = class_names[top_idx]
+            # Inference
+            with torch.no_grad():
+                logits = model(x)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
+            probs = probs[0]
+            idx = int(np.argmax(probs))
+            conf = float(probs[idx])
+            label = class_names[idx]
 
-        # Debounce & commit if stable
-        if top_idx == last_label_idx and avg_conf >= MIN_CONFIDENCE:
-            stable_counter += 1
-        else:
-            stable_counter = 1
-            last_label_idx = top_idx
+            # Smoothing window
+            window.append((idx, conf))
+            # Majority vote on indices in the window
+            counts = Counter([i for i, _ in window])
+            top_idx, occurrences = counts.most_common(1)[0]
+            # Average confidence for that class in window
+            avg_conf = np.mean([c for i, c in window if i == top_idx])
+            top_label = class_names[top_idx]
 
-        committed_char = None
-        if stable_counter >= STABILITY_FRAMES:
-            # Commit only when the class is not 'nothing'
-            if top_label == "space":
-                committed_text += " "
-                committed_char = " "
-            elif top_label == "del":
+            # Debounce & commit if stable
+            if top_idx == last_label_idx and avg_conf >= MIN_CONFIDENCE:
+                stable_counter += 1
+            else:
+                stable_counter = 1
+                last_label_idx = top_idx
+
+            committed_char = None
+            if stable_counter >= STABILITY_FRAMES:
+                # Commit only when the class is not 'nothing'
+                if top_label == "space":
+                    committed_text += " "
+                    committed_char = " "
+                elif top_label == "del":
+                    committed_text = committed_text[:-1]
+                    committed_char = "<DEL>"
+                elif top_label != "nothing":
+                    committed_text += top_label
+                    committed_char = top_label
+                stable_counter = 0  # reset after commit
+
+            # FPS
+            now = time.time()
+            dt = now - prev_time
+            if dt > 0:
+                fps = 1.0 / dt
+            prev_time = now
+
+            # Draw overlays (committed text, current pred, bbox, fps)
+            if DRAW:
+                cur_disp = committed_char if committed_char is not None else top_label
+                cur_conf = avg_conf if committed_char is None else 1.0
+                draw_overlay(frame, committed_text, cur_disp, cur_conf, bbox=bbox, fps=fps)
+
+            cv2.imshow("ASL Gesture Typing", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('c'):
+                committed_text = ""
+            elif key == ord('b'):
                 committed_text = committed_text[:-1]
-                committed_char = "<DEL>"
-            elif top_label != "nothing":
-                committed_text += top_label
-                committed_char = top_label
-            stable_counter = 0  # reset after commit
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        if hands is not None:
+            hands.close()
 
-        # FPS
-        now = time.time()
-        dt = now - prev_time
-        if dt > 0:
-            fps = 1.0 / dt
-        prev_time = now
-
-        # Draw overlays
-        if DRAW:
-            cur_disp = committed_char if committed_char is not None else top_label
-            cur_conf = avg_conf if committed_char is None else 1.0
-            draw_overlay(frame, committed_text, cur_disp, cur_conf, bbox=bbox, fps=fps)
-
-        cv2.imshow("ASL Gesture Typing", frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord('c'):
-            committed_text = ""
-        elif key == ord('b'):
-            committed_text = committed_text[:-1]
-
-    cap.release()
-    cv2.destroyAllWindows()
     print("\nFinal text:", committed_text)
 
 
